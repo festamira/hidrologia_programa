@@ -1,0 +1,506 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import io
+
+# ==========================================
+# CONFIGURAÇÕES
+# ==========================================
+st.set_page_config(
+    page_title="Análise Hidrológica — SIGRH/SP Águas",
+    layout="wide",
+    page_icon="🌊"
+)
+
+LIMITE_ONU_M3_HAB_ANO = 1700
+LIMITE_ONU_M3_HAB_DIA = LIMITE_ONU_M3_HAB_ANO / 365
+
+# Tabela de parâmetros de Gumbel para série finita
+# Fonte: Chow, Maidment & Mays (1988) — Applied Hydrology
+GUMBEL_TABLE = {
+    10:  (0.4952, 0.9497),
+    15:  (0.5128, 1.0206),
+    20:  (0.5236, 1.0628),
+    25:  (0.5309, 1.0915),
+    30:  (0.5362, 1.1124),
+    35:  (0.5402, 1.1285),
+    40:  (0.5436, 1.1413),
+    45:  (0.5463, 1.1519),
+    50:  (0.5485, 1.1607),
+    75:  (0.5548, 1.1854),
+    100: (0.5600, 1.2065),
+    200: (0.5670, 1.2360),
+    500: (0.5724, 1.2585),
+    1000:(0.5748, 1.2685),
+}
+
+# ==========================================
+# FUNÇÕES AUXILIARES
+# ==========================================
+def parse_br_number(val):
+    if pd.isna(val):
+        return np.nan
+    s = str(val).strip()
+    if s in ('', '---', 'nan', 'None'):
+        return np.nan
+    s = s.replace('.', '').replace(',', '.')
+    try:
+        return float(s)
+    except ValueError:
+        return np.nan
+
+def read_sigrh_csv(uploaded_file):
+    """Lê CSV do SIGRH/SP Águas no formato 'Ano;Janeiro;Fevereiro;...'."""
+    stringio = io.StringIO(uploaded_file.getvalue().decode("utf-8-sig"))
+    lines = stringio.readlines()
+    start_idx = 0
+    for i, line in enumerate(lines):
+        if line.strip().startswith('Ano;Janeiro'):
+            start_idx = i
+            break
+    stringio.seek(0)
+    df = pd.read_csv(stringio, sep=';', skiprows=start_idx, encoding='utf-8-sig')
+    df = df.rename(columns={df.columns[0]: 'Ano'})
+    df['Ano'] = pd.to_numeric(df['Ano'].astype(str).str.strip(), errors='coerce')
+    df = df.dropna(subset=['Ano'])
+    df['Ano'] = df['Ano'].astype(int)
+    df = df.set_index('Ano')
+    for col in df.columns:
+        df[col] = df[col].apply(parse_br_number)
+    return df
+
+def fill_missing_values(df, start_year, end_year):
+    """Filtra período e preenche falhas mensais com a média dos anos anteriores."""
+    df_period = df.loc[(df.index >= start_year) & (df.index <= end_year)].copy()
+    df_period = df_period.dropna(how='all')
+    for col in df_period.columns:
+        for i in range(len(df_period)):
+            if pd.isna(df_period[col].iloc[i]):
+                prev_vals = df_period[col].iloc[:i].dropna()
+                if len(prev_vals) > 0:
+                    df_period.iloc[i, df_period.columns.get_loc(col)] = prev_vals.mean()
+    return df_period
+
+def calculate_fdc(df_flows):
+    """Curva de Permanência (Kimball). p = Mo/(n+1) — CORRIGIDO."""
+    clean = df_flows.dropna()
+    if len(clean) == 0:
+        return np.nan, np.nan, np.nan, np.array([]), np.array([])
+    sorted_flows = np.sort(clean.values)[::-1]  # decrescente
+    n = len(sorted_flows)
+    m = np.arange(1, n + 1)
+    p = m / (n + 1)  # probabilidade de excedência — CRESCENTE
+    # np.interp exige xp crescente; sorted_flows é decrescente ✅
+    q50 = np.interp(0.50, p, sorted_flows)
+    q90 = np.interp(0.90, p, sorted_flows)
+    q95 = np.interp(0.95, p, sorted_flows)
+    return q50, q90, q95, p, sorted_flows
+
+def gumbel_flow(annual_flows, return_periods, use_finite_correction=True):
+    """Método de Gumbel para Qmáx/Qmín com correção de série finita."""
+    x = np.array(annual_flows.dropna())
+    if len(x) < 2:
+        return {t: np.nan for t in return_periods}
+    mean_x = np.mean(x)
+    std_x = np.std(x, ddof=1)
+    n = len(x)
+    
+    if use_finite_correction:
+        if n < 10:
+            yn_n, sn_n = GUMBEL_TABLE[10]
+        elif n >= 1000:
+            yn_n, sn_n = GUMBEL_TABLE[1000]
+        else:
+            ns = sorted(GUMBEL_TABLE.keys())
+            yns = [GUMBEL_TABLE[k][0] for k in ns]
+            sns = [GUMBEL_TABLE[k][1] for k in ns]
+            yn_n = np.interp(n, ns, yns)
+            sn_n = np.interp(n, ns, sns)
+    else:
+        yn_n, sn_n = 0.5772, 1.2825
+    
+    results = {}
+    for T in return_periods:
+        if T <= 1:
+            results[T] = np.nan
+            continue
+        y_T = -np.log(-np.log(1 - 1/T))
+        results[T] = mean_x + (std_x / sn_n) * (y_T - yn_n)
+    return results
+
+def calc_balanco_hidrico(df_chuva, df_vazao, area_km2, start, end):
+    """Balanço Hídrico: ET = P - Q (mm/ano)."""
+    try:
+        df_ch = fill_missing_values(df_chuva, start, end)
+        df_qa = fill_missing_values(df_vazao, start, end)
+        P_medio = df_ch.sum(axis=1).mean()
+        q_flat = df_qa.values.flatten()
+        q_flat = q_flat[~np.isnan(q_flat)]
+        if len(q_flat) == 0 or pd.isna(P_medio):
+            return np.nan, np.nan, np.nan
+        Q_medio_m3s = q_flat.mean()
+        Q_mm = (Q_medio_m3s * 86400 * 365) / (area_km2 * 1e6) * 1000
+        ET = P_medio - Q_mm
+        return P_medio, Q_mm, ET
+    except Exception:
+        return np.nan, np.nan, np.nan
+
+# ==========================================
+# CABEÇALHO
+# ==========================================
+st.title("🌊 Análise de Indicadores Hidrológicos")
+st.markdown(
+    "Sistema para cálculo de **Curva de Permanência**, **Vazões Extremas (Gumbel)**, "
+    "**Vazão Específica**, **Balanço Hídrico** e **Disponibilidade Hídrica** "
+    "a partir de séries históricas do **SIGRH / SP Águas**."
+)
+
+# ==========================================
+# SIDEBAR
+# ==========================================
+with st.sidebar:
+    st.header("⚙️ Configurações")
+    populacao = st.number_input(
+        "População da bacia (habitantes)",
+        value=5788015, step=1000, min_value=1,
+        help="População total da área de drenagem do posto (IBGE / CBH)"
+    )
+    area_km2 = st.number_input(
+        "Área da bacia (km²)",
+        value=3394.0, step=1.0, min_value=0.1,
+        help="Área de drenagem do posto (consta no cabeçalho do CSV)"
+    )
+    
+    st.markdown("---")
+    st.header("📁 Upload de Dados")
+    st.caption("CSVs exportados do SIGRH (hidrologia.spaguas.sp.gov.br)")
+    
+    file_qmed = st.file_uploader("Vazões Médias Mensais (obrigatório)", type=['csv'])
+    file_qmax = st.file_uploader("Vazões Máximas Mensais (obrigatório)", type=['csv'])
+    file_qmin = st.file_uploader("Vazões Mínimas Mensais (obrigatório)", type=['csv'])
+    file_chuva = st.file_uploader("Chuva Mensal (opcional — p/ Balanço Hídrico)", type=['csv'])
+    
+    st.markdown("---")
+    st.header("📅 Períodos")
+    periodos = {'1961-1990': (1961, 1990), '1991-2020': (1991, 2020)}
+    st.write("• **1961-1990**")
+    st.write("• **1991-2020**")
+    
+    st.markdown("---")
+    st.header("📐 Gumbel")
+    gumbel_finito = st.checkbox(
+        "Usar correção de série finita (recomendado)",
+        value=True,
+        help="Aplica tabela de ȳn e σn (Chow et al., 1988). "
+             "Sem correção, usa forma assintótica (n→∞)."
+    )
+    
+    st.markdown("---")
+    processar = st.button("▶️ Processar Dados", type="primary", use_container_width=True)
+
+# ==========================================
+# ABAS
+# ==========================================
+tab_analise, tab_metodologia, tab_sobre = st.tabs(
+    ["📊 Resultados", "📐 Metodologia", "ℹ️ Sobre"]
+)
+
+# ==========================================
+# TAB — METODOLOGIA
+# ==========================================
+with tab_metodologia:
+    st.header("Metodologia e Equações Utilizadas")
+    st.markdown(
+        "Todas as equações baseiam-se no Capítulo 5 — *Recursos Hídricos e Indicadores "
+        "Hidrológicos* — de autoria de **Manuel Enrique Gamero Guandique, Leandro Cardoso "
+        "de Morais e Paulo Sergio Tonello**, no livro *Meio Ambiente e Sustentabilidade* "
+        "(Rosa, Fraceto e Carlos, Orgs.)."
+    )
+    
+    st.subheader("1. Balanço Hídrico de Massa")
+    st.latex(r"P - Q - ET \pm \Delta S = 0 \quad \text{(Eq. 1)}")
+    st.markdown("Para um ano hídrico, $\\Delta S \\approx 0$:")
+    st.latex(r"ET = P - Q \quad \text{(Eq. 2)}")
+    st.markdown("$P$ = precipitação (mm); $Q$ = deflúvio (mm); $ET$ = evapotranspiração (mm).")
+    st.markdown("**Conversão de vazão (m³/s) para lâmina (mm/ano):**")
+    st.latex(r"Q_{\text{mm}} = \frac{Q_{\text{m³/s}} \cdot 86400 \cdot 365}{A_{\text{km²}} \cdot 10^6} \cdot 1000")
+    
+    st.subheader("2. Vazão Média")
+    st.latex(r"\bar{Q} = \frac{1}{n} \sum_{t=1}^{n} Q_t \quad \text{(Eq. 3)}")
+    
+    st.subheader("3. Vazão Específica")
+    st.latex(r"Q_e = \frac{Q_m}{A_i} \cdot 1000 \quad \text{(Eq. 4)}")
+    st.markdown("$Q_e$ = L/s·km²; $Q_m$ = vazão média (m³/s); $A_i$ = área (km²).")
+    
+    st.subheader("4. Probabilidade (Critério de Kimball)")
+    st.latex(r"Pr(x) = \frac{M_o}{n+1} \quad \text{(Eq. 6)}")
+    st.markdown("$M_o$ = ordem na série ordenada; $n$ = nº de observações.")
+    
+    st.subheader("5. Tempo de Retorno")
+    st.latex(r"T = \frac{1}{Pr} = \frac{n+1}{M_o} \quad \text{(Eq. 7)}")
+    
+    st.subheader("6. Curva de Permanência")
+    st.markdown(
+        "Valores ordenados de forma **decrescente**; a cada $Q_{(i)}$ associa-se "
+        "$p_i = i/(n+1)$. **Q50, Q90 e Q95** obtidas por interpolação linear da curva empírica:"
+    )
+    st.latex(r"Q_p = \text{interp}(p;\; p_i, Q_{(i)})")
+    st.markdown("A **Q95** é a vazão igualada ou superada em 95% do tempo (referência de outorga).")
+    
+    st.subheader("7. Método de Gumbel")
+    st.latex(r"x_T = \bar{x} + \frac{s}{\sigma_n} \left( y_T - \bar{y}_n \right)")
+    st.latex(r"y_T = -\ln\left[-\ln\left(1 - \frac{1}{T}\right)\right]")
+    st.markdown(
+        "$\\bar{x}$ = média dos extremos; $s$ = desvio padrão; "
+        "$\\bar{y}_n, \\sigma_n$ = parâmetros tabelados (Chow et al., 1988). "
+        "Para $n \\to \\infty$: $\\bar{y}_\\infty = 0{,}5772$, $\\sigma_\\infty = 1{,}2825$."
+    )
+    st.caption("Referência: Chow, V. T.; Maidment, D. R.; Mays, L. W. *Applied Hydrology*. McGraw-Hill, 1988.")
+    
+    st.subheader("8. Disponibilidade Hídrica *per capita*")
+    st.latex(r"DH = \frac{Q_{\text{ref}}}{Pop} \cdot 86400 \quad [\text{m³/hab/dia}]")
+    st.markdown("$Q_{\\text{ref}}$ = vazão de referência (adota-se **Q95**); $Pop$ = população (hab).")
+    
+    st.subheader("9. Classificação da ONU")
+    st.table(pd.DataFrame({
+        'Volume per capita (m³/hab/ano)': ['> 1.700', '1.000 – 1.700', '500 – 1.000', '< 500'],
+        'Situação': ['Estresse eventual', 'Estresse periódico e regular', 'Estresse crônico', 'Escassez absoluta']
+    }))
+    st.caption("Fonte: Beeckman (1999), adaptado no Cap. 5 (Quadro 5.3).")
+    
+    st.subheader("📚 Referências")
+    st.markdown("""
+    > **GUANDIQUE, M. E. G.; MORAIS, L. C.; TONELLO, P. S.** 
+    > *Recursos hídricos e indicadores hidrológicos*. 
+    > In: ROSA, A. H.; FRACETO, L. F.; CARLOS, V. M. (Orgs.). 
+    > **Meio Ambiente e Sustentabilidade**. Capítulo 5, p. 99–123.
+
+    > **CHOW, V. T.; MAIDMENT, D. R.; MAYS, L. W.** *Applied Hydrology*. McGraw-Hill, 1988.
+
+    > **BEECKMAN, G. B.** *Gerenciamento Integrado dos Recursos Hídricos*. Brasília: IICA, 1999.
+
+    > **ANA — Agência Nacional de Águas.** *Conjuntura dos Recursos Hídricos no Brasil*. Brasília, 2009.
+    """)
+
+# ==========================================
+# TAB — SOBRE
+# ==========================================
+with tab_sobre:
+    st.header("Sobre este sistema")
+    st.markdown("""
+    Este aplicativo automatiza a análise de indicadores hidrológicos a partir das 
+    séries históricas do **SIGRH — Sistema de Informações para o Gerenciamento de 
+    Recursos Hídricos do Estado de São Paulo** 
+    ([hidrologia.spaguas.sp.gov.br](https://hidrologia.spaguas.sp.gov.br/)).
+    
+    ### Como usar
+    
+    1. Acesse o portal do SIGRH / SP Águas.
+    2. Navegue até **Base Documental → Banco de Dados Hidrológicos → Fluviométricos**.
+    3. Selecione o posto desejado (ex.: 4D-001 — Usina Ester).
+    4. Exporte em CSV:
+       - **Vazões Médias Mensais**
+       - **Vazões Máximas Mensais**
+       - **Vazões Mínimas Mensais**
+       - *(Opcional)* **Chuva Mensal** do mesmo posto ou de pluviométrico próximo.
+    5. Faça o upload, informe população e área (que constam no cabeçalho do CSV) e 
+       clique em **Processar Dados**.
+    
+    ### Saídas
+    
+    - Curva de Permanência (Q50, Q90, Q95);
+    - Vazões extremas por Gumbel (Qmáx Tr=10/50/100/1000 e Qmín Tr=10);
+    - Vazão específica (L/s·km²);
+    - Balanço hídrico (P, Q, ET em mm/ano) — se chuva carregada;
+    - Disponibilidade hídrica *per capita* (m³/hab/dia) vs. limite ONU;
+    - Comparação entre os dois períodos;
+    - Download em Excel.
+    
+    ### Tratamento de falhas
+    
+    Falhas **mensais** são preenchidas com a **média aritmética dos anos anteriores** 
+    para o mesmo mês. Anos **completamente vazios** são desconsiderados.
+    
+    ### Compatibilidade
+    
+    O parser detecta automaticamente o cabeçalho `Ano;Janeiro;...` em qualquer CSV 
+    exportado do SIGRH, independentemente do nome do arquivo. Funciona para 
+    **qualquer posto** fluviométrico ou pluviométrico do SP Águas.
+    """)
+
+# ==========================================
+# TAB — RESULTADOS
+# ==========================================
+with tab_analise:
+    if not processar:
+        st.info(
+            "👈 Preencha as configurações na barra lateral, faça o upload dos "
+            "arquivos CSV e clique em **▶️ Processar Dados**."
+        )
+    elif not (file_qmed and file_qmax and file_qmin):
+        st.warning("⚠️ Os três arquivos de vazão são obrigatórios.")
+    else:
+        try:
+            with st.spinner("Processando dados..."):
+                df_qmed = read_sigrh_csv(file_qmed)
+                df_qmax = read_sigrh_csv(file_qmax)
+                df_qmin = read_sigrh_csv(file_qmin)
+                df_chuva = read_sigrh_csv(file_chuva) if file_chuva else None
+                
+                resultados = {}
+                fdc_dados = {}
+                
+                for nome, (start, end) in periodos.items():
+                    qmed_p = fill_missing_values(df_qmed, start, end)
+                    qmax_p = fill_missing_values(df_qmax, start, end)
+                    qmin_p = fill_missing_values(df_qmin, start, end)
+                    
+                    qmed_flat = qmed_p.values.flatten()
+                    q50, q90, q95, p_vals, q_vals = calculate_fdc(pd.Series(qmed_flat))
+                    fdc_dados[nome] = (p_vals, q_vals)
+                    
+                    q_esp_q95 = (q95 / area_km2) * 1000 if pd.notna(q95) else np.nan
+                    
+                    annual_qmax = qmax_p.max(axis=1)
+                    annual_qmin = qmin_p.min(axis=1)
+                    g_qmax = gumbel_flow(annual_qmax, [10, 50, 100, 1000], gumbel_finito)
+                    g_qmin = gumbel_flow(annual_qmin, [10], gumbel_finito)
+                    
+                    if df_chuva is not None:
+                        P_med, Q_mm, ET = calc_balanco_hidrico(df_chuva, df_qmed, area_km2, start, end)
+                    else:
+                        P_med, Q_mm, ET = np.nan, np.nan, np.nan
+                    
+                    dh_q95 = (q95 / populacao) * 86400 if pd.notna(q95) else np.nan
+                    dh_qmin = (g_qmin[10] / populacao) * 86400 if pd.notna(g_qmin[10]) else np.nan
+                    
+                    resultados[nome] = {
+                        'Q50 (m³/s)': q50,
+                        'Q90 (m³/s)': q90,
+                        'Q95 (m³/s)': q95,
+                        'Vazão Específica Q95 (L/s·km²)': q_esp_q95,
+                        'Qmáx Tr=10 (m³/s)': g_qmax[10],
+                        'Qmáx Tr=50 (m³/s)': g_qmax[50],
+                        'Qmáx Tr=100 (m³/s)': g_qmax[100],
+                        'Qmáx Tr=1000 (m³/s)': g_qmax[1000],
+                        'Qmín Tr=10 (m³/s)': g_qmin[10],
+                        'P média (mm/ano)': P_med,
+                        'Q média (mm/ano)': Q_mm,
+                        'ET estimada (mm/ano)': ET,
+                        'DH (Q95) — m³/hab/dia': dh_q95,
+                        'DH (Qmín Tr=10) — m³/hab/dia': dh_qmin,
+                    }
+                
+                st.success("✅ Dados processados com sucesso!")
+                
+                # KPIs
+                st.subheader("📊 Resumo Comparativo")
+                k1, k2 = st.columns(2)
+                for col_widget, (nome, dados) in zip([k1, k2], resultados.items()):
+                    with col_widget:
+                        st.markdown(f"### {nome}")
+                        st.metric("Q95 (referência)", f"{dados['Q95 (m³/s)']:.2f} m³/s")
+                        st.metric(
+                            "Disponibilidade Hídrica (Q95)",
+                            f"{dados['DH (Q95) — m³/hab/dia']:.4f} m³/hab/dia"
+                        )
+                
+                # Gráfico FDC
+                st.subheader("📈 Curva de Permanência")
+                fig = go.Figure()
+                for nome, (p_vals, q_vals) in fdc_dados.items():
+                    if len(p_vals) > 0:
+                        fig.add_trace(go.Scatter(
+                            x=p_vals * 100, y=q_vals,
+                            mode='lines', name=nome,
+                            line=dict(width=2.5)
+                        ))
+                for pct in [50, 90, 95]:
+                    fig.add_vline(
+                        x=pct, line_dash="dash", line_color="gray",
+                        annotation_text=f"Q{pct}", annotation_position="top"
+                    )
+                fig.update_layout(
+                    xaxis_title="Probabilidade de excedência (%)",
+                    yaxis_title="Vazão (m³/s)",
+                    hovermode="x unified",
+                    template="plotly_white",
+                    xaxis=dict(range=[0, 100]),
+                    height=500
+                )
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Tabela
+                st.subheader("📋 Tabela Completa de Resultados")
+                df_res = pd.DataFrame(resultados).T
+                st.dataframe(df_res.style.format("{:.2f}", na_rep="—"), use_container_width=True)
+                
+                # ONU
+                st.subheader("⚖️ Comparação com a Legislação (ONU)")
+                st.info(
+                    f"Limite da ONU: **{LIMITE_ONU_M3_HAB_ANO} m³/hab/ano** "
+                    f"(≈ **{LIMITE_ONU_M3_HAB_DIA:.2f} m³/hab/dia**)."
+                )
+                for nome in periodos.keys():
+                    dh = resultados[nome]['DH (Q95) — m³/hab/dia']
+                    if pd.notna(dh):
+                        if dh < LIMITE_ONU_M3_HAB_DIA:
+                            st.error(
+                                f"**{nome}**: {dh:.4f} m³/hab/dia — "
+                                f"⚠️ **ABAIXO** do limite (Estresse Hídrico)"
+                            )
+                        else:
+                            st.success(
+                                f"**{nome}**: {dh:.4f} m³/hab/dia — "
+                                f"✅ **ACIMA** do limite"
+                            )
+                    else:
+                        st.warning(f"**{nome}**: dados insuficientes para calcular DH.")
+                
+                # Comparação entre períodos
+                st.subheader("🔍 Análise Comparativa entre Períodos")
+                if len(resultados) == 2:
+                    p1, p2 = list(resultados.keys())
+                    var_q95 = (
+                        (resultados[p2]['Q95 (m³/s)'] - resultados[p1]['Q95 (m³/s)'])
+                        / resultados[p1]['Q95 (m³/s)'] * 100
+                    ) if resultados[p1]['Q95 (m³/s)'] > 0 else np.nan
+                    var_dh = (
+                        (resultados[p2]['DH (Q95) — m³/hab/dia'] - resultados[p1]['DH (Q95) — m³/hab/dia'])
+                        / resultados[p1]['DH (Q95) — m³/hab/dia'] * 100
+                    ) if resultados[p1]['DH (Q95) — m³/hab/dia'] > 0 else np.nan
+                    
+                    c1, c2 = st.columns(2)
+                    c1.metric(
+                        f"Variação de Q95 ({p1} → {p2})",
+                        f"{var_q95:+.2f}%" if pd.notna(var_q95) else "—"
+                    )
+                    c2.metric(
+                        f"Variação de DH ({p1} → {p2})",
+                        f"{var_dh:+.2f}%" if pd.notna(var_dh) else "—"
+                    )
+                    
+                    if pd.notna(var_q95) and var_q95 < -10:
+                        st.warning(
+                            "A Q95 caiu mais de 10% entre os períodos — "
+                            "indício de redução da disponibilidade hídrica superficial."
+                        )
+                
+                # Download
+                st.subheader("💾 Download dos Resultados")
+                buffer = io.BytesIO()
+                with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+                    df_res.to_excel(writer, sheet_name='Resultados')
+                st.download_button(
+                    label="📥 Baixar planilha Excel",
+                    data=buffer.getvalue(),
+                    file_name="resultados_hidrologicos.xlsx",
+                    mime="application/vnd.ms-excel",
+                    use_container_width=True
+                )
+        
+        except Exception as e:
+            st.error(f"❌ Erro ao processar os dados: {e}")
+            with st.expander("Ver detalhes técnicos do erro"):
+                st.exception(e)
